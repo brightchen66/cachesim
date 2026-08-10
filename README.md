@@ -140,20 +140,7 @@ time id size [extra...]
 1 4 233
 ```
 
-## 算法说明
-
-| 算法 | 类型 | 注册名 | 说明 |
-|------|------|--------|------|
-| LRU | 在线 | `lru` | 驱逐最近最少访问的项 |
-| LFU | 在线 | `lfu` | 驱逐访问频次最低的项（平局按 LRU） |
-| FIFO | 在线 | `fifo` | 驱逐最先加入的项 |
-| Random | 在线 | `random` | 随机驱逐 |
-| Randomized Marking | 在线 | `randomized_marking` | 随机化标记算法（2Hₖ 竞争比） |
-| Belady | 离线 | `belady` | 驱逐下次使用最远的项（等长页面下最优离线基准；变长对象缓存下为启发式基准） |
-| Bit-Model Online | 在线 | `bit_model_online` | Learning-Augmented 论文算法（维护缓存状态分布 µ） |
-| Local-Ratio Caching | 离线 | `local_ratio_caching` | Bar-Noy et al. STOC 2000 离线 4-近似（local-ratio + loss-min 归约，优化 reload 代价） |
-
-### 模型
+## 模型
 
 - `bit` (默认): cost = size（按字节计代价）
 - `fault`: cost = 1（每次未命中代价相同）
@@ -179,7 +166,7 @@ time id size [extra...]
 > - **对象数竞争比** = 算法未命中次数 / Belady 未命中次数（fault 模型，每次未命中代价为 1）；
 > - **字节数竞争比** = 算法字节代价 / Belady 字节代价（bit 模型，代价为取回字节数）。
 >
-> **关于 Belady 的“最优”范围（重要）**：Belady MIN（驱逐下次使用最远的项）在**等长页面**（经典分页）下是离线最优；但本框架是**变长对象缓存**，变长离线最优是 NP 难的，Belady 在此仅是**启发式基准**、并非真正最优。
+> **关于 Belady **：Belady MIN（驱逐下次使用最远的项）在**等长页面**（经典分页）下是离线最优；但本框架是**变长对象缓存**，变长离线最优是 NP 难的，Belady 在此仅是**启发式基准**、并非真正最优。
 >
 > 字节代价取各算法的取回字节数：LRU/Belady 为字节未命中量 (byte_total − byte_hit)，bit_model_online 因维护缓存状态分布会额外取回页面，其字节代价取 fetch_cost
 
