@@ -256,8 +256,10 @@ class LocalRatioCaching:
     # 理论近似比上界
     APPROX_RATIO = 4.0
 
-    def __init__(self, eps: float = 1e-9):
+    def __init__(self, eps: float = 1e-9, verbose: bool = False):
         self.eps = float(eps)
+        # verbose=True 时逐轮打印 local-ratio 递归的最拥塞时间点 t* 等信息
+        self.verbose = bool(verbose)
 
     def solve(self, trace: Iterable[Tuple], capacity: int,
               cost_model: str = "bit") -> Dict:
@@ -337,13 +339,15 @@ class LocalRatioCaching:
 
         m = len(inst_a)
         scheduled: set = set()
+        iterations: List[Dict] = []
         if m > 0:
-            scheduled = self._solve_schedule(
+            scheduled, iterations = self._solve_schedule(
                 n, S, eps, width_at,
                 inst_a, inst_b, inst_w, inst_pen)
 
         return {
             "scheduled": scheduled,
+            "iterations": iterations,
             "inst_a": inst_a, "inst_b": inst_b, "inst_w": inst_w,
             "inst_req": inst_req, "inst_for_req": inst_for_req,
             "prev": prev, "req_size": req_size, "page_size": page_size,
@@ -366,6 +370,7 @@ class LocalRatioCaching:
         n = sol["n"]
         items = sol["items"]
         scheduled = sol["scheduled"]
+        iterations = sol["iterations"]
         inst_for_req = sol["inst_for_req"]
         prev = sol["prev"]
         req_size = sol["req_size"]
@@ -428,15 +433,18 @@ class LocalRatioCaching:
                 "num_instances": len(inst_for_req),
                 "num_scheduled": len(scheduled),
                 "approx_ratio_bound": self.APPROX_RATIO,
+                "num_rounds": len(iterations),          # local-ratio 递归轮数
+                # 每轮递归记录：round / t_star / delta_star / num_z / p / num_deleted
+                "iterations": iterations,
             },
         )
 
     # ---------------------------------------------------------------------------------
-    # local-ratio 调度求解：返回被调度（保留）的实例 id 集合
+    # local-ratio 调度求解：返回 (被调度实例 id 集合, 每轮递归记录列表)
     # ---------------------------------------------------------------------------------
     def _solve_schedule(self, n: int, S: int, eps: float, width_at: List[int],
                         inst_a: List[int], inst_b: List[int],
-                        inst_w: List[float], inst_pen: List[float]) -> set:
+                        inst_w: List[float], inst_pen: List[float]) -> Tuple[set, List[Dict]]:
         m = len(inst_a)
         # 值域线段树：Δ(t) = W_live(t) - Width(t)。初始 = -Width(t)，每实例 +w 于其区间。
         init_delta = [0.0] * (n + 1)
@@ -454,6 +462,9 @@ class LocalRatioCaching:
         pen = list(inst_pen)        # 当前 penalty（可变副本）
         alive = [True] * m
         stack: List[int] = []       # 删除顺序（阶段 2 LIFO 弹出）
+        # 每轮递归记录：round / t_star（最拥塞时间点）/ delta_star（过载量）/
+        # num_z（覆盖 t* 的存活实例数）/ p（局部 penalty 比例因子）/ num_deleted（本轮删除数）
+        iterations: List[Dict] = []
 
         # ---- 阶段 1：local-ratio 迭代 ----
         # 仅在 [2, n-1] 寻找最大过载点（实例区间均落在此范围内）。
@@ -464,8 +475,8 @@ class LocalRatioCaching:
             hi_q = n
         if lo_q > hi_q:
             # 无中间时刻：所有实例“存活到终止”，全部调度（若可行）
-            return self._finalize(m, n, eps, width_at, inst_a, inst_b, inst_w,
-                                  alive, stack)
+            return (self._finalize(m, n, eps, width_at, inst_a, inst_b, inst_w,
+                                   alive, stack), iterations)
 
         while True:
             val, t_star = val_tree.range_max_argmax(lo_q, hi_q)
@@ -498,6 +509,19 @@ class LocalRatioCaching:
                 pen[iid] -= best_p * mw
                 if pen[iid] <= eps:
                     to_delete.append(iid)
+            # ---- 记录本轮递归（论文中每次递归调用对应此处一轮迭代）----
+            iterations.append({
+                "round": len(iterations) + 1,
+                "t_star": t_star,          # 最拥塞时间点：argmax Δ(t)
+                "delta_star": delta_star,  # 过载量 A*
+                "num_z": len(Z),           # 覆盖 t* 的存活实例数 |Z(t*)|
+                "p": best_p,               # 使某 penalty 恰好降为 0 的比例因子
+                "num_deleted": len(to_delete),
+            })
+            if self.verbose:
+                print(f"[local-ratio 第{len(iterations)}轮] 最拥塞时间点 t*={t_star}, "
+                      f"Δ*={delta_star:g}, |Z(t*)|={len(Z)}, p={best_p:g}, "
+                      f"删除 {len(to_delete)} 个实例")
             for iid in to_delete:
                 alive[iid] = False
                 val_tree.range_add(inst_a[iid], inst_b[iid], -inst_w[iid])
@@ -515,9 +539,11 @@ class LocalRatioCaching:
                 val_tree.range_add(inst_a[mn_id], inst_b[mn_id], -inst_w[mn_id])
                 itree.remove(mn_id, inst_a[mn_id], inst_b[mn_id])
                 stack.append(mn_id)
+                if iterations:
+                    iterations[-1]["num_deleted"] = 1   # 强制删除也计入
 
-        return self._finalize(m, n, eps, width_at, inst_a, inst_b, inst_w,
-                              alive, stack)
+        return (self._finalize(m, n, eps, width_at, inst_a, inst_b, inst_w,
+                               alive, stack), iterations)
 
     def _finalize(self, m: int, n: int, eps: float, width_at: List[int],
                   inst_a: List[int], inst_b: List[int], inst_w: List[float],
@@ -639,5 +665,6 @@ def optimal_caching_bruteforce(trace: Iterable[Tuple], capacity: int,
 
 
 @register("local_ratio_caching")
-def _make_local_ratio_caching(eps: float = 1e-9) -> LocalRatioCaching:
-    return LocalRatioCaching(eps=eps)
+def _make_local_ratio_caching(eps: float = 1e-9,
+                              verbose: bool = False) -> LocalRatioCaching:
+    return LocalRatioCaching(eps=eps, verbose=verbose)
