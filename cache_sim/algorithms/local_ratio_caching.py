@@ -60,6 +60,10 @@ local-ratio 定理把该界传递到原 penalty。
     阶段 2 维护 slack(t)=Width(t)−已调度宽度 取区间最小判可行性。
   * 区间线段树（按区间规范分解存实例 id 集合）：O(log n + |Z|) 查询覆盖 t* 的存活实例。
 - cost 模型：bit/general -> c(j)=size(j)（优化字节代价）；fault -> c(j)=1（优化未命中次数）。
+- evictions 口径（调度->驱逐的等价转换，两类驱逐均计数）：
+  * 实例未调度：页面在上次请求后立即驱逐、下次请求重载（归约中付 penalty 的事件）；
+  * 死页：页面最后一次请求后按归约约定立即驱逐（“请求后立即驱逐”的 WLOG 约定）。
+  即 evictions = 未调度实例数 + 不同可缓存页数 = 可缓存页全部载入次数。
 """
 
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -268,7 +272,7 @@ class LocalRatioCaching:
         返回字典含：
           - scheduled: 被调度（保留）的实例 id 集合；
           - inst_a/inst_b/inst_w/inst_req/inst_for_req: 实例元数据；
-          - prev/req_size/page_size/width_at/cost_model/S/n: 调度上下文。
+          - prev/nxt/req_size/page_size/width_at/cost_model/S/n: 调度上下文。
         """
         if capacity <= 0:
             raise ValueError(f"capacity 必须为正，得到 {capacity}")
@@ -301,6 +305,14 @@ class LocalRatioCaching:
         for i in range(1, n + 1):
             oid = items[i - 1][1]
             prev[i] = last.get(oid, 0)
+            last[oid] = i
+
+        # ---- next[i] = 页 r(i) 下一次请求的序号（1-indexed），0 表示无（该请求后为死页）----
+        nxt = [0] * (n + 1)
+        last.clear()
+        for i in range(n, 0, -1):
+            oid = items[i - 1][1]
+            nxt[i] = last.get(oid, 0)
             last[oid] = i
 
         # ---- Width(t) for t=1..n：r(t) 可缓存则 S-s(r(t))，否则 S（不缓存，全空间留给保留页）----
@@ -350,7 +362,7 @@ class LocalRatioCaching:
             "iterations": iterations,
             "inst_a": inst_a, "inst_b": inst_b, "inst_w": inst_w,
             "inst_req": inst_req, "inst_for_req": inst_for_req,
-            "prev": prev, "req_size": req_size, "page_size": page_size,
+            "prev": prev, "nxt": nxt, "req_size": req_size, "page_size": page_size,
             "width_at": width_at, "cost_model": cost_model, "S": S, "n": n,
             "items": items, "cacheable": cacheable, "cost_of": cost_of,
         }
@@ -373,6 +385,8 @@ class LocalRatioCaching:
         iterations = sol["iterations"]
         inst_for_req = sol["inst_for_req"]
         prev = sol["prev"]
+        nxt = sol["nxt"]
+        page_size = sol["page_size"]
         req_size = sol["req_size"]
         cost_of = sol["cost_of"]
         cacheable = sol["cacheable"]
@@ -384,31 +398,46 @@ class LocalRatioCaching:
         evictions = 0
         cost = 0.0
 
-        # ---- 由调度统计命中/未命中/代价 ----
+        # ---- 由调度统计命中/未命中/代价/驱逐 ----
+        # 驱逐口径（与调度的等价转换一致，两类事件均计数）：
+        #   (a) 实例未调度：页面在上次请求后立即被驱逐、本次重载 -- 一次驱逐；
+        #   (b) 死页：某页最后一次请求后（无后续请求）按归约约定立即驱逐 -- 一次驱逐。
+        # 故 evictions = 未调度实例数 + 不同可缓存页数 = 可缓存页的全部载入次数
+        # （每次载入的驻留期恰好以一次驱逐结束）。
         for i in range(1, n + 1):
             oid = items[i - 1][1]
             sz = req_size[i]
             byte_total += sz
             j = prev[i]
             c = cost_of(oid)
-            if j == 0 or not cacheable(oid):
-                # 首次请求 / 不可缓存页：强制未命中
+            cacheable_i = cacheable(oid)
+            if j == 0:
+                # 首次请求：强制载入（不可缓存页不入缓存，仅计 miss）
                 misses += 1
                 cost += c
-                continue
-            if i - j < 2:
+            elif not cacheable_i:
+                # 不可缓存页：无法驻留，每次请求都未命中
+                misses += 1
+                cost += c
+            elif i - j < 2:
                 # 连续请求：页面自上次请求仍保留，命中
                 hits += 1
                 byte_hit += sz
-                continue
-            iid = inst_for_req.get(i)
-            if iid is not None and iid in scheduled:
+            elif page_size.get(oid, 0) <= 0:
+                # 零大小页：不占空间、必然可保留（solve 跳过建实例），命中
                 hits += 1
                 byte_hit += sz
             else:
-                misses += 1
-                cost += c
-                evictions += 1   # 该页在两次请求间被驱逐并重新载入
+                iid = inst_for_req.get(i)
+                if iid is not None and iid in scheduled:
+                    hits += 1
+                    byte_hit += sz
+                else:
+                    misses += 1
+                    cost += c
+                    evictions += 1   # (a) 实例未调度：请求 j 后被驱逐，本次重载
+            if cacheable_i and nxt[i] == 0:
+                evictions += 1       # (b) 死页：该请求后立即驱逐，释放空间
 
         return SimulationResult(
             cache_type="content",
