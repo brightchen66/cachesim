@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.egg-info/
 .eggs/
@@ -34,3 +35,4 @@ A Unified Approach to Approximating Resource Allocation and Scheduling.pdf
 项目设计.md
 算法分析.md
 CODE_WIKI.md
+.gitignore

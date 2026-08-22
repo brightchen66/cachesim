@@ -26,6 +26,14 @@ r"""General Caching 4-approximation -- Bar-Noy et al. (STOC 2000) §4 + §4.1.
 “调度（选中）该实例” = 在 (j,i) 期间保留 p，则 i 时刻命中、省下 c(p)；
 “未调度” = 驱逐并重新载入，付 penalty c(p)。故**最小化未调度 penalty = 最小化 reload cost**。
 
+死页扩展（超出论文归约的部分）：论文只为两次真实请求间的驻留建实例，末次请求后无后续
+请求的页面不建实例（其驻留不影响代价）。本实现按用户指定的模型，假设死页的“下次请求”
+为 n+1，为末次请求 j（j≤n-1）建立**虚拟实例** [j+1,n]：未调度 <=> 末次请求后驱逐；
+被调度 <=> 保留至 trace 结尾。虚拟实例参与 local-ratio 优化（与真实实例竞争空间与
+penalty），但其 penalty 仅存在于模型（n+1 不在真实请求序列内），**不计入真实 reload
+cost**；代价是算法的 4-近似保证只对“真实+虚拟”的扩展目标成立，对真实 cost 不再有
+直接的 4-近似保证（真实 cost ≤ 扩展代价 ≤ 4·OPT(扩展)）。
+
 资源宽度 Width(t) = S − s(r(t))（时刻 t 请求页 r(t) 必在缓存，留给“保留页”的空间）。
 仅当 i−j≥2（存在至少一个中间时刻）才创建实例；i−j==1（连续请求）页面必然保留（命中）；
 首次请求 / 不可缓存页（s>S）为强制未命中（固定代价，不参与优化）。
@@ -61,9 +69,10 @@ local-ratio 定理把该界传递到原 penalty。
   * 区间线段树（按区间规范分解存实例 id 集合）：O(log n + |Z|) 查询覆盖 t* 的存活实例。
 - cost 模型：bit/general -> c(j)=size(j)（优化字节代价）；fault -> c(j)=1（优化未命中次数）。
 - evictions 口径（调度->驱逐的等价转换，两类驱逐均计数）：
-  * 实例未调度：页面在上次请求后立即驱逐、下次请求重载（归约中付 penalty 的事件）；
-  * 死页：页面最后一次请求后按归约约定立即驱逐（“请求后立即驱逐”的 WLOG 约定）。
-  即 evictions = 未调度实例数 + 不同可缓存页数 = 可缓存页全部载入次数。
+  * 真实实例未调度：页面在上次请求后立即驱逐、下次请求重载（真实 reload 事件）；
+  * 虚拟实例（死页）未调度：末次请求后驱逐（模型事件）；被调度则保留至结尾、不驱逐
+    （末次请求恰在 n 的页面与零大小页同样保留至结尾）。
+  即 evictions = 未调度真实实例数 + 未调度虚拟实例数。
 """
 
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -271,7 +280,9 @@ class LocalRatioCaching:
 
         返回字典含：
           - scheduled: 被调度（保留）的实例 id 集合；
-          - inst_a/inst_b/inst_w/inst_req/inst_for_req: 实例元数据；
+          - iterations: 每轮递归记录（t* / Δ* / |Z| / p / 删除数与删除对象 size 范围）；
+          - inst_a/inst_b/inst_w/inst_pen/inst_req/inst_virtual: 实例元数据；
+          - inst_for_req: 请求 i -> 真实实例 iid；inst_for_final: 末次请求 i -> 虚拟实例 iid；
           - prev/nxt/req_size/page_size/width_at/cost_model/S/n: 调度上下文。
         """
         if capacity <= 0:
@@ -323,31 +334,50 @@ class LocalRatioCaching:
             width_at[t] = S if st > S else S - st
 
         # ---- 构造活动实例 ----
-        # 实例 iid：区间 [a,b]、width w、penalty π、对应请求 i（决定命中/未命中）
+        # 实例 iid：区间 [a,b]、width w、penalty π、对应请求序号（见 inst_req）。
+        # 两类实例：
+        #   * 真实实例：页面在两次真实连续请求 (j,i) 之间（i-j>=2），区间 [j+1,i-1]；
+        #     未调度 <=> 请求 j 后驱逐、i 时重载（penalty = 真实 reload cost）。
+        #   * 虚拟实例（死页扩展）：末次请求 j 后无后续请求（nxt[j]==0），假设
+        #     “下次请求”为 n+1，区间 [j+1,n]（要求 j<=n-1，j==n 时区间空、必然保留）；
+        #     未调度 <=> 末次请求后驱逐。其 penalty 只存在于模型（n+1 不在真实请求
+        #     序列内），**不计入真实 reload cost**。
         inst_a: List[int] = []
         inst_b: List[int] = []
         inst_w: List[float] = []
         inst_pen: List[float] = []
         inst_req: List[int] = []        # 该实例对应的请求序号 i
-        inst_for_req: Dict[int, int] = {}   # 请求 i -> 实例 iid（i-j>=2 且可缓存时）
+        inst_virtual: List[bool] = []   # True = 虚拟实例（死页，假设下次请求 n+1）
+        inst_for_req: Dict[int, int] = {}   # 请求 i -> 真实实例 iid（i-j>=2 且可缓存时）
+        inst_for_final: Dict[int, int] = {} # 末次请求 i（nxt=0）-> 虚拟实例 iid
         for i in range(1, n + 1):
             oid = items[i - 1][1]
             j = prev[i]
             if j == 0 or not cacheable(oid):
                 continue
-            if i - j < 2:
-                continue  # 连续请求（i-j==1）：必然保留命中，无需实例
-            a, b = j + 1, i - 1
             w = float(page_size[oid])
             if w <= 0:
-                continue  # 零大小页：不占空间、不参与过载，跳过（必然可保留）
-            iid = len(inst_a)
-            inst_a.append(a)
-            inst_b.append(b)
-            inst_w.append(w)
-            inst_pen.append(cost_of(oid))   # penalty = reload cost c(p)
-            inst_req.append(i)
-            inst_for_req[i] = iid
+                continue  # 零大小页：不占空间、必然可保留（真实请求命中、死页保留至结尾）
+            if i - j >= 2:
+                # 真实实例：区间内保留 <=> 请求 i 命中
+                iid = len(inst_a)
+                inst_a.append(j + 1)
+                inst_b.append(i - 1)
+                inst_w.append(w)
+                inst_pen.append(cost_of(oid))   # penalty = reload cost c(p)
+                inst_req.append(i)
+                inst_virtual.append(False)
+                inst_for_req[i] = iid
+            if nxt[i] == 0 and i <= n - 1:
+                # 虚拟实例：末次请求后保留至结尾（“下次请求”为虚拟的 n+1）
+                iid = len(inst_a)
+                inst_a.append(i + 1)
+                inst_b.append(n)
+                inst_w.append(w)
+                inst_pen.append(cost_of(oid))   # 仅模型 penalty，不计入真实 cost
+                inst_req.append(i)              # 对应末次请求（虚拟下次请求为 n+1）
+                inst_virtual.append(True)
+                inst_for_final[i] = iid
 
         m = len(inst_a)
         scheduled: set = set()
@@ -361,7 +391,9 @@ class LocalRatioCaching:
             "scheduled": scheduled,
             "iterations": iterations,
             "inst_a": inst_a, "inst_b": inst_b, "inst_w": inst_w,
-            "inst_req": inst_req, "inst_for_req": inst_for_req,
+            "inst_pen": inst_pen, "inst_req": inst_req,
+            "inst_virtual": inst_virtual,
+            "inst_for_req": inst_for_req, "inst_for_final": inst_for_final,
             "prev": prev, "nxt": nxt, "req_size": req_size, "page_size": page_size,
             "width_at": width_at, "cost_model": cost_model, "S": S, "n": n,
             "items": items, "cacheable": cacheable, "cost_of": cost_of,
@@ -384,6 +416,9 @@ class LocalRatioCaching:
         scheduled = sol["scheduled"]
         iterations = sol["iterations"]
         inst_for_req = sol["inst_for_req"]
+        inst_for_final = sol["inst_for_final"]
+        inst_virtual = sol["inst_virtual"]
+        inst_pen = sol["inst_pen"]
         prev = sol["prev"]
         nxt = sol["nxt"]
         page_size = sol["page_size"]
@@ -400,10 +435,14 @@ class LocalRatioCaching:
 
         # ---- 由调度统计命中/未命中/代价/驱逐 ----
         # 驱逐口径（与调度的等价转换一致，两类事件均计数）：
-        #   (a) 实例未调度：页面在上次请求后立即被驱逐、本次重载 -- 一次驱逐；
-        #   (b) 死页：某页最后一次请求后（无后续请求）按归约约定立即驱逐 -- 一次驱逐。
-        # 故 evictions = 未调度实例数 + 不同可缓存页数 = 可缓存页的全部载入次数
-        # （每次载入的驻留期恰好以一次驱逐结束）。
+        #   (a) 真实实例未调度：页面在上次请求后立即被驱逐、本次重载 -- 一次驱逐；
+        #   (b) 虚拟实例（死页，假设下次请求 n+1）未调度：末次请求后驱逐 -- 一次驱逐；
+        #       被调度 / 末次请求恰在 n（区间空，必保留）/ 零大小页：保留至结尾，不驱逐。
+        # 故 evictions = 未调度真实实例数 + 未调度虚拟实例数；
+        # cost 仍为**真实** reload 代价（虚拟 penalty 不计入，n+1 不在请求序列内）。
+        virtual_penalty = sum(
+            inst_pen[iid] for iid in range(len(inst_virtual))
+            if inst_virtual[iid] and iid not in scheduled)
         for i in range(1, n + 1):
             oid = items[i - 1][1]
             sz = req_size[i]
@@ -436,8 +475,13 @@ class LocalRatioCaching:
                     misses += 1
                     cost += c
                     evictions += 1   # (a) 实例未调度：请求 j 后被驱逐，本次重载
-            if cacheable_i and nxt[i] == 0:
-                evictions += 1       # (b) 死页：该请求后立即驱逐，释放空间
+            if nxt[i] == 0 and cacheable_i:
+                # (b) 死页：末次请求后是否驱逐由虚拟实例（假设下次请求 n+1）决定
+                viid = inst_for_final.get(i)
+                if viid is not None and viid not in scheduled:
+                    evictions += 1       # 虚拟实例未调度：末次请求后驱逐
+                # 否则（虚拟实例被调度 / 末次请求恰在 n / 零大小页）：
+                # 保留至 trace 结尾，不驱逐
 
         return SimulationResult(
             cache_type="content",
@@ -463,8 +507,12 @@ class LocalRatioCaching:
                 "num_scheduled": len(scheduled),
                 "approx_ratio_bound": self.APPROX_RATIO,
                 "num_rounds": len(iterations),          # local-ratio 递归轮数
-                # 每轮递归记录：round / t_star / delta_star / num_z / p / num_deleted
+                # 每轮递归记录：round / t_star / delta_star / num_z / p /
+                # num_deleted / del_size_min/max/sum（删除实例的对象 size 范围）
                 "iterations": iterations,
+                # 虚拟实例（死页，假设下次请求 n+1）统计；其 penalty 为模型代价，不计入 cost
+                "num_virtual_instances": sum(inst_virtual),
+                "virtual_penalty": virtual_penalty,
             },
         )
 
@@ -492,16 +540,13 @@ class LocalRatioCaching:
         alive = [True] * m
         stack: List[int] = []       # 删除顺序（阶段 2 LIFO 弹出）
         # 每轮递归记录：round / t_star（最拥塞时间点）/ delta_star（过载量）/
-        # num_z（覆盖 t* 的存活实例数）/ p（局部 penalty 比例因子）/ num_deleted（本轮删除数）
+        # num_z（覆盖 t* 的存活实例数）/ p（局部 penalty 比例因子）/
+        # num_deleted（本轮删除数）/ del_size_min/max/sum（删除实例的对象 size 范围）
         iterations: List[Dict] = []
 
         # ---- 阶段 1：local-ratio 迭代 ----
-        # 仅在 [2, n-1] 寻找最大过载点（实例区间均落在此范围内）。
-        lo_q, hi_q = 2, n - 1
-        if lo_q < 1:
-            lo_q = 1
-        if hi_q > n:
-            hi_q = n
+        # 在 [2, n] 寻找最大过载点（真实实例区间 ⊆ [2,n-1]，虚拟实例延伸到 n）。
+        lo_q, hi_q = 2, n
         if lo_q > hi_q:
             # 无中间时刻：所有实例“存活到终止”，全部调度（若可行）
             return (self._finalize(m, n, eps, width_at, inst_a, inst_b, inst_w,
@@ -538,19 +583,7 @@ class LocalRatioCaching:
                 pen[iid] -= best_p * mw
                 if pen[iid] <= eps:
                     to_delete.append(iid)
-            # ---- 记录本轮递归（论文中每次递归调用对应此处一轮迭代）----
-            iterations.append({
-                "round": len(iterations) + 1,
-                "t_star": t_star,          # 最拥塞时间点：argmax Δ(t)
-                "delta_star": delta_star,  # 过载量 A*
-                "num_z": len(Z),           # 覆盖 t* 的存活实例数 |Z(t*)|
-                "p": best_p,               # 使某 penalty 恰好降为 0 的比例因子
-                "num_deleted": len(to_delete),
-            })
-            if self.verbose:
-                print(f"[local-ratio 第{len(iterations)}轮] 最拥塞时间点 t*={t_star}, "
-                      f"Δ*={delta_star:g}, |Z(t*)|={len(Z)}, p={best_p:g}, "
-                      f"删除 {len(to_delete)} 个实例")
+            round_deleted = list(to_delete)
             for iid in to_delete:
                 alive[iid] = False
                 val_tree.range_add(inst_a[iid], inst_b[iid], -inst_w[iid])
@@ -568,8 +601,27 @@ class LocalRatioCaching:
                 val_tree.range_add(inst_a[mn_id], inst_b[mn_id], -inst_w[mn_id])
                 itree.remove(mn_id, inst_a[mn_id], inst_b[mn_id])
                 stack.append(mn_id)
-                if iterations:
-                    iterations[-1]["num_deleted"] = 1   # 强制删除也计入
+                round_deleted.append(mn_id)
+            # ---- 记录本轮递归（论文中每次递归调用对应此处一轮迭代）----
+            d_sizes = [inst_w[iid] for iid in round_deleted]
+            iterations.append({
+                "round": len(iterations) + 1,
+                "t_star": t_star,          # 最拥塞时间点：argmax Δ(t)
+                "delta_star": delta_star,  # 过载量 A*
+                "num_z": len(Z),           # 覆盖 t* 的存活实例数 |Z(t*)|
+                "p": best_p,               # 使某 penalty 恰好降为 0 的比例因子
+                "num_deleted": len(round_deleted),
+                # 本轮删除实例对应对象的 size 范围与总和（width = s(p)）
+                "del_size_min": min(d_sizes) if d_sizes else None,
+                "del_size_max": max(d_sizes) if d_sizes else None,
+                "del_size_sum": sum(d_sizes) if d_sizes else 0.0,
+            })
+            if self.verbose:
+                rng_txt = (f"（对象大小 {min(d_sizes):g}–{max(d_sizes):g} 字节，"
+                           f"合计 {sum(d_sizes):g}）") if d_sizes else ""
+                print(f"[local-ratio 第{len(iterations)}轮] 最拥塞时间点 t*={t_star}, "
+                      f"Δ*={delta_star:g}, |Z(t*)|={len(Z)}, p={best_p:g}, "
+                      f"删除 {len(round_deleted)} 个实例{rng_txt}")
 
         return (self._finalize(m, n, eps, width_at, inst_a, inst_b, inst_w,
                                alive, stack), iterations)
